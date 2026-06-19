@@ -30,7 +30,7 @@ func main() {
 
 			location := ev.ResponseHeader.Get("Location")
 			u, err := url.Parse(location)
-			if err != nil || !strings.EqualFold(u.Hostname(), "ids.hit.edu.cn") {
+			if err != nil || !strings.EqualFold(u.Hostname(), "trust.hitsz.edu.cn") {
 				return true
 			}
 
@@ -52,7 +52,7 @@ func main() {
 	}
 	defer srv.Close()
 
-	localURL, err := srv.Start(ctx, "https://ids.hit.edu.cn")
+	localURL, err := srv.Start(ctx, "https://ids-hit-edu-cn-s.hitsz.edu.cn")
 	if err != nil {
 		log.Fatal(err)
 	}

@@ -20,18 +20,18 @@ func (s *Server) rewriteBody(req *http.Request, contentType string, body []byte)
 	rewritten := body
 	switch ct {
 	case "text/html", "application/xhtml+xml":
-		rewritten = []byte(s.rewriteHTML(req, string(body)))
+		rewritten = []byte(s.rewriteHTML(string(body)))
 	case "text/css":
-		rewritten = []byte(s.rewriteCSS(req, string(body)))
+		rewritten = []byte(s.rewriteCSS(string(body)))
 	case "application/javascript", "application/ecmascript", "text/javascript":
-		rewritten = []byte(s.rewriteJS(req, string(body)))
+		rewritten = []byte(rewriteJS(string(body)))
 	case "application/json":
-		rewritten = []byte(s.rewriteQuotedURLStrings(req, string(body)))
+		rewritten = []byte(s.rewriteQuotedURLStrings(string(body)))
 	case "image/svg+xml", "application/xml", "text/xml":
-		rewritten = []byte(s.rewriteXML(req, string(body)))
+		rewritten = []byte(s.rewriteXML(string(body)))
 	default:
 		if strings.HasPrefix(ct, "text/") {
-			rewritten = []byte(s.rewriteQuotedURLStrings(req, string(body)))
+			rewritten = []byte(s.rewriteQuotedURLStrings(string(body)))
 		}
 	}
 
@@ -47,7 +47,7 @@ func (s *Server) rewriteBody(req *http.Request, contentType string, body []byte)
 	})
 }
 
-func (s *Server) rewriteHTML(req *http.Request, html string) string {
+func (s *Server) rewriteHTML(html string) string {
 	var out strings.Builder
 	for i := 0; i < len(html); {
 		next := strings.IndexByte(html[i:], '<')
@@ -67,7 +67,7 @@ func (s *Server) rewriteHTML(req *http.Request, html string) string {
 
 		tag := html[next : end+1]
 		lowerTag := strings.ToLower(tag)
-		out.WriteString(s.rewriteHTMLTag(req, tag))
+		out.WriteString(s.rewriteHTMLTag(tag))
 
 		switch {
 		case strings.HasPrefix(lowerTag, "<style"):
@@ -76,7 +76,7 @@ func (s *Server) rewriteHTML(req *http.Request, html string) string {
 				i = end + 1
 				continue
 			}
-			out.WriteString(s.rewriteCSS(req, html[end+1:closeStart]))
+			out.WriteString(s.rewriteCSS(html[end+1 : closeStart]))
 			out.WriteString(html[closeStart:closeEnd])
 			i = closeEnd
 		case strings.HasPrefix(lowerTag, "<script"):
@@ -85,7 +85,7 @@ func (s *Server) rewriteHTML(req *http.Request, html string) string {
 				i = end + 1
 				continue
 			}
-			out.WriteString(s.rewriteJS(req, html[end+1:closeStart]))
+			out.WriteString(rewriteJS(html[end+1 : closeStart]))
 			out.WriteString(html[closeStart:closeEnd])
 			i = closeEnd
 		default:
@@ -95,14 +95,14 @@ func (s *Server) rewriteHTML(req *http.Request, html string) string {
 	return out.String()
 }
 
-func (s *Server) rewriteJS(req *http.Request, js string) string {
+func rewriteJS(js string) string {
 	return js
 }
 
-func (s *Server) rewriteHTMLTag(req *http.Request, tag string) string {
+func (s *Server) rewriteHTMLTag(tag string) string {
 	tag = htmlURLAttrPattern.ReplaceAllStringFunc(tag, func(match string) string {
 		return rewriteHTMLAttrMatch(match, func(value string) string {
-			if rewritten, ok := s.rewriteURLValue(req, value); ok {
+			if rewritten, ok := s.rewriteURLValue(value); ok {
 				return rewritten
 			}
 			return value
@@ -110,12 +110,12 @@ func (s *Server) rewriteHTMLTag(req *http.Request, tag string) string {
 	})
 	tag = htmlSetAttrPattern.ReplaceAllStringFunc(tag, func(match string) string {
 		return rewriteHTMLAttrMatch(match, func(value string) string {
-			return s.rewriteSrcset(req, value)
+			return s.rewriteSrcset(value)
 		})
 	})
 	tag = htmlStyleAttrPat.ReplaceAllStringFunc(tag, func(match string) string {
 		return rewriteHTMLAttrMatch(match, func(value string) string {
-			return s.rewriteCSS(req, value)
+			return s.rewriteCSS(value)
 		})
 	})
 	return tag
@@ -145,7 +145,7 @@ func rewriteHTMLAttrMatch(match string, rewrite func(string) string) string {
 	return match[:valueStart] + rewrite(match[valueStart:valueEnd]) + match[valueEnd:]
 }
 
-func (s *Server) rewriteSrcset(req *http.Request, value string) string {
+func (s *Server) rewriteSrcset(value string) string {
 	parts := strings.Split(value, ",")
 	for i, part := range parts {
 		leading := leadingWhitespace(part)
@@ -157,7 +157,7 @@ func (s *Server) rewriteSrcset(req *http.Request, value string) string {
 		if len(fields) == 0 {
 			continue
 		}
-		if rewritten, ok := s.rewriteURLValue(req, fields[0]); ok {
+		if rewritten, ok := s.rewriteURLValue(fields[0]); ok {
 			fields[0] = rewritten
 			parts[i] = leading + strings.Join(fields, " ")
 		}
@@ -165,10 +165,10 @@ func (s *Server) rewriteSrcset(req *http.Request, value string) string {
 	return strings.Join(parts, ",")
 }
 
-func (s *Server) rewriteXML(req *http.Request, xmlText string) string {
+func (s *Server) rewriteXML(xmlText string) string {
 	return htmlURLAttrPattern.ReplaceAllStringFunc(xmlText, func(match string) string {
 		return rewriteHTMLAttrMatch(match, func(value string) string {
-			if rewritten, ok := s.rewriteURLValue(req, value); ok {
+			if rewritten, ok := s.rewriteURLValue(value); ok {
 				return rewritten
 			}
 			return value
@@ -176,16 +176,16 @@ func (s *Server) rewriteXML(req *http.Request, xmlText string) string {
 	})
 }
 
-func (s *Server) rewriteCSS(req *http.Request, css string) string {
+func (s *Server) rewriteCSS(css string) string {
 	var out strings.Builder
 	for i := 0; i < len(css); {
 		idx := indexFold(css[i:], "url(")
 		if idx < 0 {
-			out.WriteString(s.rewriteQuotedURLStrings(req, css[i:]))
+			out.WriteString(s.rewriteQuotedURLStrings(css[i:]))
 			break
 		}
 		idx += i
-		out.WriteString(s.rewriteQuotedURLStrings(req, css[i:idx]))
+		out.WriteString(s.rewriteQuotedURLStrings(css[i:idx]))
 		out.WriteString(css[idx : idx+4])
 
 		j := idx + 4
@@ -213,7 +213,7 @@ func (s *Server) rewriteCSS(req *http.Request, css string) string {
 		}
 
 		value := strings.TrimSpace(css[valueStart:j])
-		if rewritten, ok := s.rewriteURLValue(req, value); ok {
+		if rewritten, ok := s.rewriteURLValue(value); ok {
 			out.WriteString(rewritten)
 		} else {
 			out.WriteString(css[valueStart:j])
@@ -236,7 +236,7 @@ func (s *Server) rewriteCSS(req *http.Request, css string) string {
 	return out.String()
 }
 
-func (s *Server) rewriteQuotedURLStrings(req *http.Request, text string) string {
+func (s *Server) rewriteQuotedURLStrings(text string) string {
 	var out strings.Builder
 	for i := 0; i < len(text); {
 		ch := text[i]
@@ -264,14 +264,14 @@ func (s *Server) rewriteQuotedURLStrings(req *http.Request, text string) string 
 			break
 		}
 		out.WriteByte(quote)
-		out.WriteString(s.rewriteURLsInStringValue(req, text[start+1:i]))
+		out.WriteString(s.rewriteURLsInStringValue(text[start+1 : i]))
 		out.WriteByte(quote)
 		i++
 	}
 	return out.String()
 }
 
-func (s *Server) rewriteURLsInStringValue(req *http.Request, value string) string {
+func (s *Server) rewriteURLsInStringValue(value string) string {
 	var out strings.Builder
 	for i := 0; i < len(value); {
 		start, isProtocolRelative := findURLStart(value, i)
@@ -288,7 +288,7 @@ func (s *Server) rewriteURLsInStringValue(req *http.Request, value string) strin
 		raw := value[start:end]
 		if isProtocolRelative && !looksLikeNetworkHost(raw[2:]) {
 			out.WriteString(raw)
-		} else if rewritten, ok := s.rewriteURLValue(req, raw); ok {
+		} else if rewritten, ok := s.rewriteURLValue(raw); ok {
 			out.WriteString(rewritten)
 		} else {
 			out.WriteString(raw)
@@ -298,7 +298,7 @@ func (s *Server) rewriteURLsInStringValue(req *http.Request, value string) strin
 	return out.String()
 }
 
-func (s *Server) rewriteURLValue(req *http.Request, raw string) (string, bool) {
+func (s *Server) rewriteURLValue(raw string) (string, bool) {
 	if shouldSkipRawURL(raw) {
 		return "", false
 	}
@@ -322,7 +322,7 @@ func (s *Server) rewriteURLValue(req *http.Request, raw string) (string, bool) {
 		return "", false
 	}
 
-	port, _, err := s.ensureRoute(u)
+	port, _, err := s.getOrCreateRoute(u)
 	if err != nil {
 		return "", false
 	}

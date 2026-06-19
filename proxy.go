@@ -24,7 +24,7 @@ const (
 type Config struct {
 	BindAddr string
 
-	ProxyURL  *url.URL
+	ProxyURL  *url.URL //Set if httpProxy is needed;
 	Transport http.RoundTripper
 
 	ResponseHook ResponseHook
@@ -79,6 +79,8 @@ type originRoute struct {
 	httpSrv  *http.Server
 }
 
+// Construction and default hooks.
+
 func New(cfg Config) (*Server, error) {
 	if cfg.BindAddr == "" {
 		cfg.BindAddr = defaultBindAddr
@@ -128,13 +130,15 @@ func NoopRewriteHook(_ *Server, ev RewriteEvent) []byte {
 	return ev.RewrittenBody
 }
 
+// Server lifecycle.
+
 func (s *Server) Start(ctx context.Context, rawURL string) (string, error) {
 	upstream, err := normalizeUpstream(rawURL)
 	if err != nil {
 		return "", err
 	}
 
-	port, _, err := s.ensureRoute(upstream)
+	port, _, err := s.getOrCreateRoute(upstream)
 	if err != nil {
 		return "", err
 	}
@@ -167,7 +171,9 @@ func (s *Server) Close() error {
 	return errors.Join(errs...)
 }
 
-func (s *Server) ensureRoute(upstream *url.URL) (int, *originRoute, error) {
+// Route table management.
+
+func (s *Server) getOrCreateRoute(upstream *url.URL) (int, *originRoute, error) {
 	key := originKey(upstream)
 
 	s.mu.Lock()
@@ -175,13 +181,13 @@ func (s *Server) ensureRoute(upstream *url.URL) (int, *originRoute, error) {
 		s.mu.Unlock()
 		return 0, nil, http.ErrServerClosed
 	}
-	if port, rt := s.routeByOriginLocked(key); rt != nil {
+	if port, rt := s.routeForOriginLocked(key); rt != nil {
 		s.mu.Unlock()
 		return port, rt, nil
 	}
 	s.mu.Unlock()
 
-	port, rt, err := s.listenRoute(upstream)
+	port, rt, err := s.createRoute(upstream)
 	if err != nil {
 		return 0, nil, err
 	}
@@ -192,7 +198,7 @@ func (s *Server) ensureRoute(upstream *url.URL) (int, *originRoute, error) {
 		_ = rt.httpSrv.Close()
 		return 0, nil, http.ErrServerClosed
 	}
-	if existingPort, existing := s.routeByOriginLocked(key); existing != nil {
+	if existingPort, existing := s.routeForOriginLocked(key); existing != nil {
 		_ = rt.httpSrv.Close()
 		return existingPort, existing, nil
 	}
@@ -201,7 +207,7 @@ func (s *Server) ensureRoute(upstream *url.URL) (int, *originRoute, error) {
 	return port, rt, nil
 }
 
-func (s *Server) routeByOriginLocked(key string) (int, *originRoute) {
+func (s *Server) routeForOriginLocked(key string) (int, *originRoute) {
 	port, ok := s.origins[key]
 	if !ok {
 		return 0, nil
@@ -209,7 +215,7 @@ func (s *Server) routeByOriginLocked(key string) (int, *originRoute) {
 	return port, s.routes[port]
 }
 
-func (s *Server) listenRoute(upstream *url.URL) (int, *originRoute, error) {
+func (s *Server) createRoute(upstream *url.URL) (int, *originRoute, error) {
 	ln, err := net.Listen("tcp", net.JoinHostPort(s.cfg.BindAddr, "0"))
 	if err != nil {
 		return 0, nil, err
@@ -221,7 +227,7 @@ func (s *Server) listenRoute(upstream *url.URL) (int, *originRoute, error) {
 	}
 	rt.httpSrv = &http.Server{
 		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			s.serveRoute(port, rt, w, r)
+			s.serveLocalRoute(port, rt, w, r)
 		}),
 		ReadHeaderTimeout: 15 * time.Second,
 	}
@@ -237,8 +243,10 @@ func (s *Server) listenRoute(upstream *url.URL) (int, *originRoute, error) {
 	return port, rt, nil
 }
 
-func (s *Server) serveRoute(port int, rt *originRoute, w http.ResponseWriter, r *http.Request) {
-	upstreamURL := targetURL(rt, r)
+// Request forwarding.
+
+func (s *Server) serveLocalRoute(port int, rt *originRoute, w http.ResponseWriter, r *http.Request) {
+	upstreamURL := upstreamURLForRequest(rt, r)
 	upstreamReq, err := http.NewRequestWithContext(r.Context(), r.Method, upstreamURL.String(), r.Body)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadGateway)
@@ -255,7 +263,7 @@ func (s *Server) serveRoute(port int, rt *originRoute, w http.ResponseWriter, r 
 	}
 	defer resp.Body.Close()
 
-	s.handleResponse(port, rt, w, r, upstreamURL, resp)
+	s.writeUpstreamResponse(port, rt, w, r, upstreamURL, resp)
 }
 
 func (s *Server) prepareUpstreamHeaders(upstreamReq *http.Request) {
@@ -263,18 +271,18 @@ func (s *Server) prepareUpstreamHeaders(upstreamReq *http.Request) {
 	upstreamReq.Header.Del("Accept-Encoding")
 
 	if referer := upstreamReq.Header.Get("Referer"); referer != "" {
-		if rewritten, ok := s.localToUpstreamURL(referer); ok {
+		if rewritten, ok := s.upstreamURLFromLocal(referer); ok {
 			upstreamReq.Header.Set("Referer", rewritten)
 		}
 	}
 	if origin := upstreamReq.Header.Get("Origin"); origin != "" {
-		if rewritten, ok := s.localToUpstreamOrigin(origin); ok {
+		if rewritten, ok := s.upstreamOriginFromLocal(origin); ok {
 			upstreamReq.Header.Set("Origin", rewritten)
 		}
 	}
 }
 
-func targetURL(rt *originRoute, r *http.Request) *url.URL {
+func upstreamURLForRequest(rt *originRoute, r *http.Request) *url.URL {
 	target := cloneURL(rt.upstream)
 	target.Path = joinURLPath(rt.upstream.Path, r.URL.Path)
 	target.RawPath = ""
@@ -283,23 +291,42 @@ func targetURL(rt *originRoute, r *http.Request) *url.URL {
 	return target
 }
 
-func (s *Server) handleResponse(port int, rt *originRoute, w http.ResponseWriter, req *http.Request, upstreamURL *url.URL, resp *http.Response) {
-	bufferBody := shouldBufferBody(req, resp, s.cfg.MaxRewriteBody)
+// Response forwarding.
 
-	var body []byte
-	var readErr error
-	if bufferBody {
-		body, readErr = io.ReadAll(io.LimitReader(resp.Body, s.cfg.MaxRewriteBody+1))
-		if readErr == nil && int64(len(body)) > s.cfg.MaxRewriteBody {
-			readErr = fmt.Errorf("response body exceeds rewrite limit %d", s.cfg.MaxRewriteBody)
-		}
-		if readErr != nil {
-			http.Error(w, readErr.Error(), http.StatusBadGateway)
-			return
-		}
+func (s *Server) writeUpstreamResponse(port int, rt *originRoute, w http.ResponseWriter, req *http.Request, upstreamURL *url.URL, resp *http.Response) {
+	bufferBody := shouldBufferBody(req, resp, s.cfg.MaxRewriteBody)
+	body, err := s.readResponseBody(resp, bufferBody)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadGateway)
+		return
 	}
 
-	ev := ResponseEvent{
+	ev := responseEvent(port, req, upstreamURL, resp, body)
+	if !s.cfg.ResponseHook(s, ev) {
+		http.Error(w, "blocked by hook", http.StatusForbidden)
+		return
+	}
+
+	rewroteLocation := s.rewriteRedirectLocation(rt, resp)
+
+	body = s.rewriteBufferedBody(req, resp, body, bufferBody)
+	writeResponseHeader(w, resp, rewroteLocation)
+	writeResponseBody(w, req, resp, body, bufferBody)
+}
+
+func (s *Server) readResponseBody(resp *http.Response, shouldRead bool) ([]byte, error) {
+	if !shouldRead {
+		return nil, nil
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, s.cfg.MaxRewriteBody+1))
+	if err == nil && int64(len(body)) > s.cfg.MaxRewriteBody {
+		err = fmt.Errorf("response body exceeds rewrite limit %d", s.cfg.MaxRewriteBody)
+	}
+	return body, err
+}
+
+func responseEvent(port int, req *http.Request, upstreamURL *url.URL, resp *http.Response, body []byte) ResponseEvent {
+	return ResponseEvent{
 		Request:        req,
 		LocalPort:      port,
 		UpstreamURL:    cloneURL(upstreamURL),
@@ -307,40 +334,44 @@ func (s *Server) handleResponse(port int, rt *originRoute, w http.ResponseWriter
 		StatusCode:     resp.StatusCode,
 		Body:           append([]byte(nil), body...),
 	}
-	if !s.cfg.ResponseHook(s, ev) {
-		http.Error(w, "blocked by hook", http.StatusForbidden)
-		return
+}
+
+func (s *Server) rewriteBufferedBody(req *http.Request, resp *http.Response, body []byte, shouldRewrite bool) []byte {
+	if !shouldRewrite {
+		return body
 	}
-
-	rewroteLocation := s.rewriteLocation(rt, resp)
-
-	if bufferBody && isRewritableContent(resp.Header.Get("Content-Type")) {
+	if isRewritableContent(resp.Header.Get("Content-Type")) {
 		body = s.rewriteBody(req, resp.Header.Get("Content-Type"), body)
 		resp.Header.Del("Content-Encoding")
 		resp.Header.Del("Content-Length")
 		resp.ContentLength = int64(len(body))
-		resp.Header.Set("Content-Length", strconv.Itoa(len(body)))
-	} else if bufferBody {
-		resp.Header.Set("Content-Length", strconv.Itoa(len(body)))
 	}
+	resp.Header.Set("Content-Length", strconv.Itoa(len(body)))
+	return body
+}
 
+func writeResponseHeader(w http.ResponseWriter, resp *http.Response, rewroteLocation bool) {
 	copyResponseHeader(w.Header(), resp.Header)
 	if rewroteLocation {
 		w.Header().Set("Location", resp.Header.Get("Location"))
 	}
 	w.WriteHeader(resp.StatusCode)
+}
 
+func writeResponseBody(w http.ResponseWriter, req *http.Request, resp *http.Response, body []byte, hasBufferedBody bool) {
 	if req.Method == http.MethodHead {
 		return
 	}
-	if bufferBody {
+	if hasBufferedBody {
 		_, _ = w.Write(body)
 		return
 	}
 	_, _ = io.Copy(w, resp.Body)
 }
 
-func (s *Server) rewriteLocation(rt *originRoute, resp *http.Response) bool {
+// Redirect and local/upstream URL mapping.
+
+func (s *Server) rewriteRedirectLocation(rt *originRoute, resp *http.Response) bool {
 	rawLocation := resp.Header.Get("Location")
 	if rawLocation == "" {
 		return false
@@ -365,7 +396,7 @@ func (s *Server) rewriteLocation(rt *originRoute, resp *http.Response) bool {
 	target.RawQuery = loc.RawQuery
 	target.Fragment = loc.Fragment
 
-	targetPort, _, err := s.ensureRoute(target)
+	targetPort, _, err := s.getOrCreateRoute(target)
 	if err != nil {
 		return false
 	}
@@ -388,7 +419,7 @@ func (s *Server) localHost() string {
 	return strings.Trim(host, "[]")
 }
 
-func (s *Server) localToUpstreamURL(raw string) (string, bool) {
+func (s *Server) upstreamURLFromLocal(raw string) (string, bool) {
 	u, err := url.Parse(raw)
 	if err != nil || u.Host == "" {
 		return "", false
@@ -402,7 +433,7 @@ func (s *Server) localToUpstreamURL(raw string) (string, bool) {
 	return u.String(), true
 }
 
-func (s *Server) localToUpstreamOrigin(raw string) (string, bool) {
+func (s *Server) upstreamOriginFromLocal(raw string) (string, bool) {
 	u, err := url.Parse(raw)
 	if err != nil || u.Host == "" {
 		return "", false
@@ -435,6 +466,8 @@ func localPortFromHost(host string) int {
 	}
 	return port
 }
+
+// Upstream URL normalization and origin helpers.
 
 func normalizeUpstream(raw string) (*url.URL, error) {
 	if !strings.Contains(raw, "://") {
@@ -481,6 +514,8 @@ func cloneHeader(h http.Header) http.Header {
 	return cp
 }
 
+// Response header adaptation.
+
 func copyResponseHeader(dst, src http.Header) {
 	connectionHeaders := hopHeaderNames(src)
 	for k, values := range src {
@@ -512,6 +547,8 @@ func rewriteSetCookie(value string) string {
 	}
 	return strings.Join(out, "; ")
 }
+
+// Response buffering and content rewrite decisions.
 
 func shouldBufferBody(req *http.Request, resp *http.Response, max int64) bool {
 	if req.Method == http.MethodHead {
@@ -555,6 +592,8 @@ func isStreamingContent(contentType string) bool {
 	ct := strings.ToLower(strings.Split(contentType, ";")[0])
 	return ct == "text/event-stream"
 }
+
+// Hop-by-hop and unsafe response header helpers.
 
 func stripHopHeaders(h http.Header) {
 	for name := range hopHeaderNames(h) {
@@ -602,6 +641,8 @@ func shouldDropResponseHeader(k string) bool {
 func noRedirect(req *http.Request, via []*http.Request) error {
 	return http.ErrUseLastResponse
 }
+
+// Miscellaneous URL and listener helpers.
 
 func joinURLPath(a, b string) string {
 	if a == "" || a == "/" {
